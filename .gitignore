@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# 합성 데이터는 scripts/generate_data.py로 재생성 (21MB)
+data/
