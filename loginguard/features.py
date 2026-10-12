@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from statistics import mean, pstdev
 from typing import Iterable, Mapping
 
@@ -92,22 +93,36 @@ def extract_features(events: Iterable[Mapping]) -> dict[str, float]:
     }
 
 
-RULE_BLOCK_FAILS = 20  # 10분 내 실패 20회 이상 → 모델 없이 즉시 차단 (fail2ban류 규칙)
+RULE_BLOCK_FAILS = 20  # 10분 내 실패 20회 이상 → 모델 없이 즉시 차단 (안전망)
 
 
 def triage(feats: Mapping[str, float]) -> str:
-    """규칙으로 판정이 끝나는 구간과 모델이 판단할 회색지대를 나눈다.
+    """규칙으로 판정이 끝나는 구간과 모델이 판단할 구간을 나눈다.
 
-    - "allow": 실패가 한 번도 없음 → 차단할 이유 없음
-    - "rule_block": 실패가 RULE_BLOCK_FAILS회 이상 → 명백한 무차별 대입
-    - "model": 그 사이 회색지대 → ML 모델이 판정
+    - "rule_block": 실패가 RULE_BLOCK_FAILS회 이상 → 명백한 무차별 대입, 즉시 차단
+    - "model": 나머지 전부 — 성공만 있는 윈도우도 포함 (v7부터)
+      v6까지는 실패 0회를 무조건 허용했지만, 오래 공격하던 IP가 성공한 경우를 놓쳐서 없앴다.
     """
     n_fail = round(feats["fail_ratio"] * feats["n_attempts"])
-    if n_fail == 0:
-        return "allow"
     if n_fail >= RULE_BLOCK_FAILS:
         return "rule_block"
     return "model"
+
+
+ALERT_PRIOR_FAILS = 20  # 과거+이번 실패가 이 이상인 IP가 성공하면 침입 의심 경보
+
+
+def success_alert(feats: Mapping[str, float]) -> bool:
+    """공격 이력이 있는 IP의 로그인 성공 = 계정 탈취 의심.
+
+    실제 데이터에 '침입 성공' 정답이 없어 학습 대신 규칙으로 둔다. 차단이 아니라
+    보안 담당자 확인용 경보다. 정상 사용자 성공 146건에서 오경보 0건 (README 참고).
+    """
+    has_success = feats["fail_ratio"] < 1.0
+    prior_fails = math.expm1(feats.get("hist_log_fails", 0.0))
+    window_fails = feats["fail_ratio"] * feats["n_attempts"]
+    # 윈도우 안 '실패 3회 뒤 성공'만으로는 오타 친 정상 사용자도 걸려서(실제 데이터 1건) 누적 기준으로 판단
+    return has_success and (prior_fails + window_fails) >= ALERT_PRIOR_FAILS
 
 
 def to_vector(feats: Mapping[str, float]) -> list[float]:
@@ -119,7 +134,6 @@ def to_vector(feats: Mapping[str, float]) -> list[float]:
 # 10분 윈도우만으로는 "이 IP가 다시 올지" 예측이 불안정했다. 서버는 과거에 본 IP를
 # 기억할 수 있으므로, 실시간에서도 계산 가능한 이력만 피처로 쓴다 (미래 정보 사용 금지).
 # ---------------------------------------------------------------------------
-import math  # noqa: E402
 
 HISTORY_FEATURE_NAMES = [
     "hist_windows_24h",      # 최근 24시간 동안 이 IP의 실패 윈도우 수

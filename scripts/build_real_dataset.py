@@ -1,13 +1,17 @@
 """실제 sshd 로그(Loghub OpenSSH) → 학습용 윈도우 데이터셋(JSONL).
 
-문제 정의 (실제 데이터 v4)
-  "로그인 실패가 포함된 10분 윈도우를 보고, 그 IP가 다음 1시간 안에 다시 로그인을
-   시도할지(= 공격이 계속될지) 예측한다."
+문제 정의 (실제 데이터 v7)
+  "IP의 10분 로그인 기록(성공·실패 모두)을 보고, 그 IP가 다음 1시간 안에 다시 와서
+   로그인 실패를 일으킬지(= 공격이 계속될지) 예측한다."
+
+  v7 변경: 실패가 있는 윈도우만 보던 것(v4~v6)을 성공만 있는 윈도우까지 넓혔다.
+   - 실패가 없다고 무조건 통과시키면, 오래 공격하던 IP가 마침내 성공한 경우를 놓친다.
+   - '다시 오기만 하면 1'이던 라벨은 정상 사용자의 재접속도 공격으로 셌다.
+     → 라벨을 '다시 와서 실패를 일으키는가'로 바꿔 정상 재접속과 공격을 구분한다.
 
   - 라벨은 사람이 붙인 추정치가 아니라 **실제로 그 뒤에 일어난 일**(미래 로그)이다.
   - 차단이 의미 있는 건 그 IP가 다시 올 때뿐이다. 이미 떠난 IP를 막는 건 방화벽 규칙만
     늘린다. 그래서 '다시 올 IP'를 골라 선제 차단하는 것이 서비스 목표다.
-  - 실패가 없는 윈도우는 규칙으로 허용(allow)하므로 데이터에서 제외한다.
   - 로그 수집 공백(3일짜리 2곳 등) 직전 윈도우는 '다시 왔는지' 알 수 없으므로 제외한다
     (안 빼면 실제로는 계속 공격했어도 '중단'으로 잘못 라벨링됨).
 
@@ -67,17 +71,21 @@ def main():
     with out.open("w") as f:
         for ip, evs in res.events.items():
             ws = list(windows(evs))
+            ever_success = any(e["result"] == "success" for e in evs)
             for i, w in enumerate(ws):
-                if not any(e["result"] == "fail" for e in w):
-                    continue
                 end = w[-1]["ts"]
                 if censored(end, a.horizon_s, gaps, last_ts):
                     y = None   # 라벨은 없지만 IP 이력 계산에는 필요하므로 남겨 둔다
                     stats["censored"] += 1
                 else:
-                    y = int(i + 1 < len(ws) and ws[i + 1][0]["ts"] - end <= a.horizon_s)
+                    # 다음 1시간 안의 윈도우들에 실패가 하나라도 있으면 1
+                    y = int(any(e["result"] == "fail"
+                                for nxt in ws[i + 1:] if nxt[0]["ts"] - end <= a.horizon_s
+                                for e in nxt))
                     stats[y] += 1
-                f.write(json.dumps({"ts": w[0]["ts"], "ip": ip, "label": y, "events": w}) + "\n")
+                # known_user: 이 IP는 28일 중 로그인에 성공한 적이 있음 (평가용 정보, 피처 아님)
+                f.write(json.dumps({"ts": w[0]["ts"], "ip": ip, "label": y, "known_user": ever_success,
+                                    "events": w}) + "\n")
     total = stats[0] + stats[1]
     print(f"정답을 알 수 없어 제외한 윈도우: {stats['censored']:,}")
     print(f"윈도우 {total:,}개: 계속 공격 {stats[1]:,} ({stats[1]/total:.1%}), 중단 {stats[0]:,} → {out}")

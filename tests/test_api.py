@@ -46,9 +46,29 @@ def test_health_lists_features():
     assert body["status"] == "ok" and body["features"] == main._feature_names
 
 
-def test_successful_login_is_allowed_by_rule():
+def test_successful_login_is_judged_by_model(monkeypatch):
+    # v7: 실패가 없어도 규칙으로 통과시키지 않고 모델이 판단한다
+    monkeypatch.setattr(main, "_model", StubModel(0.05))
     body = post("203.0.113.10", [ev(0, "min", True, method="publickey")]).json()
-    assert body["decision"] == "allow" and body["stage"] == "rule_allow"
+    assert body["decision"] == "allow" and body["stage"] == "model"
+    assert body["alert"] is None
+
+
+def test_success_after_long_attack_raises_alert(monkeypatch):
+    monkeypatch.setattr(main, "_model", StubModel(0.1))
+    ip = "198.51.100.50"
+    post(ip, [ev(i, "root", False, gap=2) for i in range(30)])                    # 공격 이력
+    body = post(ip, [ev(0, "root", False, t0=T0 + 1200), ev(1, "root", True, t0=T0 + 1200)]).json()
+    assert body["alert"] == "possible_compromise"
+
+
+def test_success_history_is_not_recorded(monkeypatch):
+    # 서빙은 학습과 같게 '실패가 있는 윈도우'만 이력에 남긴다
+    monkeypatch.setattr(main, "_model", StubModel(0.1))
+    ip = "203.0.113.11"
+    post(ip, [ev(0, "min", True)])
+    body = post(ip, [ev(0, "min", True, t0=T0 + 1200)]).json()
+    assert body["features"]["hist_windows_24h"] == 0.0
 
 
 def test_brute_force_is_blocked_by_rule():

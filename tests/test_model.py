@@ -39,3 +39,8 @@ def test_persistent_attacker_scores_higher_than_one_off():
     p_one = _prob(one_off, IPHistory().features("y", 0))
     p_heavy = _prob(heavy, h.features("x", 5 * 700))
     assert p_heavy > p_one
+
+
+def test_known_users_not_blocked():
+    # 28일 중 로그인에 성공한 IP(정상 사용자)의 윈도우를 차단으로 판정한 비율
+    assert METRICS["holdout"]["subsets"]["known_user_block_rate"]["rate"] <= 0.05

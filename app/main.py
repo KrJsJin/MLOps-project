@@ -1,10 +1,11 @@
 """LoginGuard 서빙 API.
 
-서비스 정의: 로그인 실패가 포함된 10분 기록을 받아, 그 IP가 다음 1시간 안에 다시 공격할지
-            예측하고, 계속 공격할 IP를 차단 목록(TTL 1시간)에 올린다.
+서비스 정의: IP의 10분 로그인 기록(성공·실패 모두)을 받아, 그 IP가 다음 1시간 안에 다시 와서
+            로그인 실패를 일으킬지(= 공격이 계속될지) 예측하고, 계속 공격할 IP를 차단 목록
+            (TTL 1시간)에 올린다. 공격 이력이 있는 IP의 로그인 성공은 침입 의심 경보로 알린다.
 
 흐름: 이벤트 수신 → 10분 윈도우로 자르기 → 피처 추출(학습과 같은 코드)
-     → 허용 목록/규칙 1차 판정 → 모델 판정 → 차단 목록 등록 → IP 이력 갱신
+     → 허용 목록/안전망 규칙 → 모델 판정 → 침입 의심 경보 → 차단 목록 등록 → IP 이력 갱신
 
 호출 방법: 로그 수집기가 IP별 10분 윈도우가 끝날 때마다 한 번 호출한다
           (학습 데이터와 같은 tumbling window. 같은 이벤트를 겹쳐 보내면 이력이 중복 집계됨).
@@ -32,7 +33,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from loginguard.features import (WINDOW_SECONDS, IPHistory, _to_epoch, extract_features,
-                                 triage, window_bounds)
+                                 success_alert, triage, window_bounds)
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = Path(os.getenv("MODEL_PATH", ROOT / "models" / "model.joblib"))
@@ -51,7 +52,7 @@ _blocklist: dict[str, float] = {}   # ip -> 만료 시각(epoch)
 _history = IPHistory()
 _lock = Lock()
 
-app = FastAPI(title="LoginGuard", version="0.2.0",
+app = FastAPI(title="LoginGuard", version="0.3.0",
               description="SSH 로그인 기록으로 '1시간 안에 다시 공격할 IP'를 예측해 차단하는 API")
 
 
@@ -72,8 +73,10 @@ class PredictRequest(BaseModel):
 class PredictResponse(BaseModel):
     ip: str
     decision: Literal["allow", "block"]
-    stage: Literal["allowlist", "rule_allow", "rule_block", "model"]
-    continue_probability: float | None = Field(None, description="1시간 안에 다시 공격할 확률")
+    stage: Literal["allowlist", "rule_block", "model"]
+    continue_probability: float | None = Field(None, description="1시간 안에 다시 와서 실패를 일으킬 확률")
+    alert: Literal["possible_compromise"] | None = Field(
+        None, description="공격 이력(누적 실패 20회 이상)이 있는 IP가 로그인에 성공함 — 담당자 확인 필요")
     blocked_until: float | None
     dropped_old_events: int = Field(0, description="10분 윈도우 밖이라 버린 이벤트 수")
     features: dict[str, float]
@@ -125,15 +128,15 @@ def predict(req: PredictRequest):
         stage, decision = "allowlist", "allow"
     else:
         zone = triage(feats)
-        if zone == "allow":
-            stage, decision = "rule_allow", "allow"
-        elif zone == "rule_block":
+        if zone == "rule_block":
             stage, decision = "rule_block", "block"   # 10분 내 20회 이상 실패: 안전망으로 즉시 차단
         else:
             x = [[feats[n] for n in _feature_names]]
             prob = float(_model.predict_proba(x)[0][1])
             stage = "model"
             decision = "block" if prob >= BLOCK_THRESHOLD else "allow"
+
+    alert = "possible_compromise" if success_alert(feats) else None
 
     now = time.time()
     blocked_until = None
@@ -146,7 +149,7 @@ def predict(req: PredictRequest):
             _blocklist[ip] = blocked_until
 
     return PredictResponse(ip=ip, decision=decision, stage=stage,
-                           continue_probability=None if prob is None else round(prob, 4),
+                           continue_probability=None if prob is None else round(prob, 4), alert=alert,
                            blocked_until=blocked_until, dropped_old_events=dropped,
                            features=feats, model_version=MODEL_VERSION)
 

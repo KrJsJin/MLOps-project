@@ -41,18 +41,20 @@ def load(path):
     rows = [json.loads(line) for line in open(path)]
     rows.sort(key=lambda r: r["ts"])
     hist = IPHistory()
-    feats, y, ts = [], [], []
+    feats, y, ts, known = [], [], [], []
     for r in rows:
         start, end, n_fail = window_bounds(r["events"])
         f = extract_features(r["events"])
         f.update(hist.features(r["ip"], start))
-        hist.add(r["ip"], start, end, n_fail)
+        if n_fail > 0:                  # 서빙(app/main.py)과 같은 규칙: 실패 윈도우만 이력에 기록
+            hist.add(r["ip"], start, end, n_fail)
         if r["label"] is None:          # 수집 공백으로 정답을 모르는 윈도우: 이력에만 사용
             continue
         feats.append(f)
         y.append(r["label"])
         ts.append(start)
-    return feats, np.array(y), np.array(ts)
+        known.append(r.get("known_user", False))
+    return feats, np.array(y), np.array(ts), np.array(known)
 
 
 def metrics(y, p):
@@ -94,7 +96,7 @@ def main():
 
     drop = {d for d in a.drop.split(",") if d}
     names = [n for n in FEATURE_NAMES + ([] if a.no_history else HISTORY_FEATURE_NAMES) if n not in drop]
-    feats, y, ts = load(a.data)
+    feats, y, ts, known = load(a.data)
     X = np.array([[f[n] for n in names] for f in feats])
     n_fail = np.array([round(f["fail_ratio"] * f["n_attempts"]) for f in feats])
     print(f"윈도우 {len(y)}개 (계속 공격 {y.mean():.1%}) | 피처 {len(names)}개\n")
@@ -117,8 +119,23 @@ def main():
     # 최종: 앞 80% 학습, 마지막 20% 홀드아웃
     *_, (k, tr, te) = folds(ts)
     model = candidates(a.seed)[best].fit(X[tr], y[tr])
-    hold = metrics(y[te], model.predict(X[te]))
+    pred = model.predict(X[te])
+    hold = metrics(y[te], pred)
     hold["train_accuracy"] = round(accuracy_score(y[tr], model.predict(X[tr])), 4)
+
+    # 성공이 포함된 윈도우 / 실패만 있는 윈도우별 정확도
+    has_succ = np.array([f["fail_ratio"] < 1.0 for f in feats])
+    sub = {}
+    for name, mask in (("windows_with_success", has_succ[te]), ("windows_fail_only", ~has_succ[te])):
+        sub[name] = {"n": int(mask.sum()), "accuracy": round(accuracy_score(y[te][mask], pred[mask]), 4)}
+    # 정상 사용자(28일 중 로그인 성공한 IP) 윈도우를 차단으로 판정한 비율 — 전 기간, 롤링 예측 기준
+    oof = np.full(len(y), -1)
+    for _, ftr, fte in folds(ts):
+        oof[fte] = candidates(a.seed)[best].fit(X[ftr], y[ftr]).predict(X[fte])
+    km = known & (oof >= 0)
+    sub["known_user_block_rate"] = {"n": int(km.sum()), "rate": round(float((oof[km] == 1).mean()), 4)}
+    hold["subsets"] = sub
+    print("세부:", json.dumps(sub, ensure_ascii=False))
     print(f"\n최고 모델: {best} | 홀드아웃 acc={hold['accuracy']:.4f} bal_acc={hold['balanced_accuracy']:.4f} "
           f"P={hold['precision']:.3f} R={hold['recall']:.3f} F1={hold['f1']:.3f} (train_acc={hold['train_accuracy']:.4f})")
 
@@ -128,7 +145,7 @@ def main():
                  "sklearn_version": sklearn.__version__}, out / "model.joblib", compress=3)
     (out / "metrics.json").write_text(json.dumps(
         {"dataset": "Loghub OpenSSH (real sshd log, LabSZ, 2015-12-10 ~ 2016-01-07)",
-         "task": "10분 윈도우 후 1시간 안에 같은 IP가 다시 시도하는가",
+         "task": "10분 윈도우(성공·실패 모두) 후 1시간 안에 같은 IP가 다시 와서 로그인 실패를 일으키는가",
          "best_model": best, "feature_names": names,
          "cv_accuracy": {n: {"mean": round(float(np.mean(v)), 4), "std": round(float(np.std(v)), 4),
                              "folds": [round(float(x), 4) for x in v]} for n, v in cv.items()},
