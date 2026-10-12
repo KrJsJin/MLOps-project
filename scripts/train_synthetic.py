@@ -5,7 +5,7 @@
 - 후보 모델: 로지스틱 회귀, 랜덤 포레스트, HistGradientBoosting
 - 결과: models/model.joblib, models/metrics.json
 
-사용법: python scripts/train.py --data data/login_windows.jsonl [--drop 피처1,피처2]
+사용법: python scripts/train_synthetic.py --data data/login_windows.jsonl [--drop 피처1,피처2]
 """
 from __future__ import annotations
 

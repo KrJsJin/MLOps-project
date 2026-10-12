@@ -1,81 +1,108 @@
-# LoginGuard — SSH 로그인 기록 기반 비정상 접근 실시간 차단 API
+# LoginGuard — SSH 로그인 기록으로 "계속 공격할 IP"를 예측해 차단하는 API
 
 ## 1. 서비스 정의 (한 문장)
 
-> **클라우드 서버에 SSH 로그인을 시도한 출발지 IP의 최근 10분 기록을 받아, 그 IP를 지금 차단해야 하는지를 판정하고 차단 목록에 올리는 API.**
+> **SSH 로그인 실패가 포함된 10분 기록을 받아, 그 IP가 다음 1시간 안에 다시 공격할지 예측하고, 계속 공격할 IP를 차단 목록에 올리는 API.**
 
-- **예측 단위**: (출발지 IP × 최근 10분 윈도우) 1건
-- **출력**: `allow` / `block` + 공격 확률
-- **사용자**: 서버의 로그 수집기(Fluent Bit 등)가 호출하고, 방화벽 에이전트가 `/v1/blocklist`를 가져가 iptables·보안그룹에 반영
+- **예측 단위**: (출발지 IP × 10분 윈도우) 1건 — 윈도우 안에 로그인 실패가 1회 이상
+- **출력**: `allow` / `block` + 1시간 내 재공격 확률
+- **왜 이 정의인가**: 차단은 그 IP가 다시 올 때만 의미가 있다. 이미 떠난 IP를 막으면 방화벽 규칙만 늘어난다.
+- **사용 흐름**: 로그 수집기가 IP별 10분 윈도우가 끝날 때마다 `/v1/predict` 호출 → 방화벽 에이전트가 `/v1/blocklist`를 가져가 iptables·보안그룹에 반영
 
-## 2. 피처와 라벨
+## 2. 데이터 — 실제 sshd 로그
 
-**라벨**: 해당 윈도우가 공격(1)인지 정상(0)인지
+**[Loghub OpenSSH](https://github.com/logpai/loghub/tree/master/OpenSSH)**: 연구실 서버(LabSZ)의 실제 sshd 로그, 2015-12-10 ~ 2016-01-07, 655,146줄
 
-| 피처 | 의미 | 왜 필요한가 |
-|---|---|---|
-| `n_attempts` | 10분 내 시도 횟수 | 시도량 |
-| `fail_ratio` | 실패 비율 | 비밀번호를 모르는 공격자는 계속 실패 |
-| `n_unique_users` | 서로 다른 계정 수 | 사전 공격은 계정명을 바꿔 가며 시도 |
-| `invalid_user_ratio` | 존재하지 않는 계정 비율 | sshd `Invalid user` 로그 |
-| `privileged_user_ratio` | root/admin 등 사전 계정 비율 | 봇이 노리는 계정 |
-| `password_ratio` | 비밀번호 인증 비율 | 정상 사용자는 공개키를 많이 씀 |
-| `mean_interval_s` | 시도 간 평균 간격 | 도구는 빠르거나(brute force) 일부러 느림(low-and-slow) |
-| `interval_cv` | 간격 변동계수 | 기계적으로 일정한 간격 = 자동화 |
-| `success_after_fails` | 실패 3회 이상 뒤 성공 | 크리덴셜 스터핑 성공 = 침입 신호 |
+| 단계 | 결과 |
+|---|---|
+| 파싱 (`loginguard/sshlog.py`) | 로그인 시도 관련 198,012줄, IP 1,044개 |
+| 10분 윈도우 (실패 포함) | 5,193개 |
+| 라벨을 알 수 없어 제외 | 44개 (로그 수집 공백 직전·데이터 끝) |
+| **학습/평가** | **5,149개 — 계속 공격 43.7%, 중단 56.3%** |
 
-피처 계산은 `loginguard/features.py` 하나로 모아 **학습과 서빙이 같은 코드**를 쓰도록 했다(training-serving skew 방지).
+**라벨**: 사람이 붙인 추정이 아니라 **실제로 일어난 일**이다. 윈도우가 끝난 뒤 1시간 안에 같은 IP의 다음 로그인 시도가 로그에 있으면 1, 없으면 0.
 
-### 데이터
-실제 운영 로그에는 라벨이 없으므로, sshd에서 관찰되는 패턴을 시나리오로 정의해 합성했다(`scripts/generate_data.py`, 30일 × 하루 400윈도우, 라벨 노이즈 2%).
-정상과 공격이 겹치는 어려운 사례를 일부러 넣었다.
+데이터를 받아 다시 만들려면:
+```bash
+# https://zenodo.org/records/8196385/files/SSH.tar.gz 다운로드 후 압축 해제
+python scripts/build_real_dataset.py --log SSH.log --out data/real_windows.jsonl
+```
 
-- 정상인데 공격처럼 보임: 비밀번호가 바뀐 백업 스크립트의 반복 실패, 새벽 관리자 접속, NAT 공유 IP
-- 공격인데 정상처럼 보임: low-and-slow, 봇넷 분산 공격(IP당 1~3회), 크리덴셜 스터핑
+## 3. 피처
 
-## 3. 모델 실험 기록
+| 피처 | 의미 |
+|---|---|
+| `n_attempts`, `fail_ratio` | 10분 내 시도 수, 실패 비율 |
+| `n_unique_users`, `invalid_user_ratio`, `privileged_user_ratio` | 계정 바꿔 가며 시도, 없는 계정, root/admin 등 사전 계정 |
+| `password_ratio` | 비밀번호 인증 비율 |
+| `mean_interval_s`, `interval_cv` | 시도 간격과 그 규칙성(자동화 도구 여부) |
+| `success_after_fails` | 실패 3회 이상 뒤 성공 |
+| `hist_windows_24h` | 이 IP가 최근 24시간 동안 실패 윈도우를 남긴 횟수 |
+| `hist_log_fails` | 이 IP의 누적 실패 수 (log) |
 
-평가: **시간 순 분할**(앞 24일 학습 / 뒤 6일 테스트). 무작위 분할을 하면 미래 패턴이 학습에 섞인다.
+- 윈도우 피처와 IP 이력은 `loginguard/features.py` 하나에서 계산한다 → 학습과 서빙이 같은 코드 사용
+- 실제 로그 전체를 API에 재생해 학습 파이프라인과 비교: **피처 불일치 0건 / 5,193 윈도우**
+- 이력은 **과거 윈도우만** 사용 (미래 정보 없음)
 
-| 버전 | 변경 | 최고 테스트 정확도 | 판단 |
+## 4. 모델 실험 기록
+
+평가는 **시간 순 롤링 교차검증**(기간을 5구간으로 나눠, 앞 k구간으로 학습 → 다음 구간 테스트, 4폴드)으로 한다. 무작위 분할을 하면 미래 데이터가 학습에 섞인다.
+
+| 버전 | 데이터 / 정의 | 결과 | 판단 |
 |---|---|---|---|
-| v1 | 전체 윈도우, 피처 10개 | 0.976 | **과도하게 높음** → 피처 점검 |
-| v1-ablation | 의심 피처(`invalid_user_ratio`, `privileged_user_ratio`, `password_ratio`)를 하나씩·함께 제거 | 0.95~0.976 | 피처를 빼도 높음 → 피처가 아니라 **데이터·문제 정의** 문제 |
-| v2 | 합성 데이터 현실화: 정상 계정·공격 사전 겹침(`ubuntu`, `ec2-user`, `admin` 등), 정상 로그인 비밀번호 인증 혼재, 계정명 오타 | 0.969 | 여전히 높음 → 원인 분석 |
-| v3 | **문제 재정의**: 실패 0회(24%)와 10분 내 실패 20회 이상(22%)은 규칙으로 판정하고, 그 사이 **회색지대만 모델이 판정** | 0.950 | 쉬운 케이스가 정확도를 부풀리던 것을 제거 |
-| **v3 최종** | 기여도가 거의 0인 `night_ratio` 제거(permutation importance 0.0006) | **0.950** | 채택 |
+| v1~v3 | 합성 데이터, 공격/정상 분류 | 0.976 → 0.950 | 합성 데이터라 실제 성능을 보장 못 함 → 실제 데이터로 전환 |
+| v4-a | 실제, IP별 공격/정상 약한 라벨 | 윈도우의 97%가 공격 | 전부 "공격"이라 찍어도 0.97 → 학습 의미 없음, **문제 재정의** |
+| v4-b | 실제, "1시간 안에 다시 오는가", 윈도우 피처만, 단일 분할 | 테스트 0.954 / 학습 0.77 | 테스트가 학습보다 높음 → 분할이 우연히 쉬웠음 |
+| v4-c | 같은 정의, 롤링 CV | 0.80 ± 0.16 | 폴드별 0.62~0.95로 불안정 |
+| v5 | + 수집 공백 라벨 제외, + IP 이력 피처 3개 | 0.967 ± 0.010 | 너무 높음 → 원인 분석 |
+| v5 분석 | "직전 1시간 안에 왔으면 또 온다" 규칙 | 0.957 | 모델이 이 규칙을 베낀 것. `hist_hours_since_prev < 1h`는 **직전 윈도우의 정답 그 자체** |
+| v5 분석 | 처음 보는 IP만 예측하도록 재정의 | 양성 4~18% | 모델이 "전부 아니다" 기준선보다 낮음 → 기각 |
+| **v6 최종** | 직전 정답을 담은 피처 제거. 관성 효과는 서빙의 **차단 TTL 1시간**이 담당 | **0.923 ± 0.030** | 채택 |
 
-**최종 모델 (Random Forest, 회색지대 테스트 1,270건)**
+**최종 모델: 로지스틱 회귀** (피처 11개)
 
-| Accuracy | Precision | Recall | F1 | Train Acc |
-|---|---|---|---|---|
-| 0.950 | 0.958 | 0.951 | 0.954 | 0.949 |
+롤링 교차검증 정확도
 
-- 학습·테스트 정확도 차이가 거의 없어 과적합은 보이지 않음
-- 피처 기여도가 한 피처에 몰리지 않음 (상위: `invalid_user_ratio` 0.11, `mean_interval_s` 0.10, `password_ratio` 0.09)
-- 가장 많이 틀리는 유형: 봇넷 분산 공격(0.90)과 정상 사용자의 단발성 실패(0.89) — 1~2회 시도만으로는 원리적으로 구분이 어려운 사례
-- 비교: 로지스틱 회귀 0.918, HistGradientBoosting 0.949
+| 모델 | 평균 ± 표준편차 | 폴드 1~4 |
+|---|---|---|
+| 기준선: 다수 클래스 | 0.564 ± 0.163 | 0.664 / 0.779 / 0.386 / 0.427 |
+| 기준선: 10분 내 실패 20회 이상 | 0.811 ± 0.090 | 0.707 / 0.741 / 0.922 / 0.875 |
+| **로지스틱 회귀** | **0.923 ± 0.030** | 0.872 / 0.929 / 0.950 / 0.940 |
+| 랜덤 포레스트 | 0.909 ± 0.060 | 0.807 / 0.928 / 0.952 / 0.949 |
+| HistGradientBoosting | 0.914 ± 0.056 | 0.817 / 0.939 / 0.943 / 0.958 |
 
-> 한계: 합성 데이터라 실제 로그에서는 정확도가 더 낮을 수 있다. 다음 단계로 클라우드 VM에 SSH를 열어 실제 공격 로그를 모아 재평가할 계획.
+홀드아웃 (마지막 20% 기간, 1,030건)
 
-## 4. 판정 흐름
+| Accuracy | Balanced Acc | Precision | Recall | F1 | Train Acc |
+|---|---|---|---|---|---|
+| 0.940 | 0.942 | 0.966 | 0.927 | 0.946 | 0.943 |
+
+- 학습·홀드아웃 정확도가 비슷해 과적합 없음
+- 가장 단순한 모델이 이겼고, 폴드 간 편차도 가장 작음
+
+**한계**
+- 서버 1대, 28일치 데이터 → 다른 서버·다른 시기에서는 재검증 필요
+- 진행 중인 공격(직전 1시간 내 활동)은 "또 온다" 규칙이 0.957로 더 정확하다. 서비스에서는 그 역할을 차단 TTL이 맡는다는 전제로 설계했다
+- 규칙·모델을 합친 서비스 전체 정확도는 0.896이다. "실패 20회 이상 즉시 차단" 안전망이 일부 이미 끝난 공격도 차단하기 때문이다(보안상 의도된 보수적 선택)
+
+## 5. 판정 흐름
 
 ```
-이벤트 수신 → 피처 추출 → ALLOWLIST? ─예→ allow
-                           │아니오
-                           ├ 실패 0회        → allow   (rule_allow)
-                           ├ 실패 20회 이상   → block   (rule_block)
-                           └ 회색지대        → 모델 확률 ≥ 0.5 → block
-block → 차단 목록 등록 (TTL 1시간 후 자동 해제, 관리자 수동 해제 가능)
+이벤트 수신 → 10분 밖 이벤트 버림 → 피처 + IP 이력 → ALLOWLIST? ─예→ allow
+                                                       │아니오
+                                                       ├ 실패 0회       → allow (rule_allow)
+                                                       ├ 실패 20회 이상  → block (rule_block, 안전망)
+                                                       └ 그 외          → 모델: 재공격 확률 ≥ 0.5 → block
+block → 차단 목록 등록 (TTL 1시간 = 예측 기간과 동일, 관리자 수동 해제 가능)
 ```
 
-## 5. API
+## 6. API
 
 | 메서드 | 경로 | 설명 |
 |---|---|---|
-| GET | `/health` | 상태, 모델 버전, 임계값 |
-| POST | `/v1/predict` | IP + 최근 10분 이벤트 → 차단 판정 |
-| GET | `/v1/blocklist` | 현재 차단 목록(방화벽 에이전트용) |
+| GET | `/health` | 상태, 모델 버전, 임계값, 사용 피처 |
+| POST | `/v1/predict` | IP + 10분 이벤트 → 재공격 확률과 차단 판정 |
+| GET | `/v1/blocklist` | 현재 차단 목록 (방화벽 에이전트용) |
 | DELETE | `/v1/blocklist/{ip}` | 오탐 수동 해제 |
 
 요청 예시:
@@ -84,22 +111,22 @@ curl -X POST localhost:8000/v1/predict -H 'content-type: application/json' -d '{
   "ip": "198.51.100.77",
   "events": [
     {"ts": "2026-10-12T03:00:00Z", "user": "oracle",   "result": "fail", "invalid_user": true},
-    {"ts": "2026-10-12T03:01:40Z", "user": "oracle",   "result": "fail", "invalid_user": true},
-    {"ts": "2026-10-12T03:03:30Z", "user": "postgres", "result": "fail", "invalid_user": true}
+    {"ts": "2026-10-12T03:00:40Z", "user": "postgres", "result": "fail", "invalid_user": true},
+    {"ts": "2026-10-12T03:01:30Z", "user": "root",     "result": "fail"}
   ]}'
 ```
-응답 요약: `"decision": "block", "stage": "model", "attack_probability": 0.995` (3회뿐이라 규칙으로는 못 잡는 low-and-slow 공격)
+응답 필드: `decision`, `stage`, `continue_probability`, `blocked_until`, `dropped_old_events`, `features`, `model_version`
 
 환경변수: `BLOCK_THRESHOLD`(0.5), `BLOCK_TTL_SECONDS`(3600), `ALLOWLIST`(예: `10.0.0.0/8`), `MODEL_PATH`
 
-## 6. 실행
+## 7. 실행
 
 ```bash
 pip install -r requirements.txt
-python scripts/generate_data.py          # data/login_windows.jsonl 생성
-python scripts/train.py                  # models/model.joblib, models/metrics.json
-uvicorn app.main:app --port 8000         # http://localhost:8000/docs 에서 Swagger 확인
-pytest                                   # 테스트 13개
+python scripts/build_real_dataset.py --log SSH.log   # data/real_windows.jsonl
+python scripts/train_real.py                         # models/model.joblib, models/metrics.json
+uvicorn app.main:app --port 8000                     # http://localhost:8000/docs
+pytest                                               # 21개
 ```
 
 Docker:
@@ -108,12 +135,17 @@ docker build -t loginguard .
 docker run -p 8000:8000 -e ALLOWLIST=10.0.0.0/8 loginguard
 ```
 
-## 7. 구조
+## 8. 구조
 ```
-loginguard/features.py   피처 추출 + 규칙 triage (학습·서빙 공용)
-scripts/generate_data.py 합성 데이터 생성
-scripts/train.py         모델 비교·학습·저장
-app/main.py              FastAPI 서빙
-models/                  학습된 모델, 지표
-tests/                   API·피처 테스트
+loginguard/sshlog.py        실제 sshd 로그 파서, 10분 윈도우 분할
+loginguard/features.py      윈도우 피처 + IP 이력 + 규칙 triage (학습·서빙 공용)
+scripts/build_real_dataset.py  실제 로그 → 라벨링된 윈도우 데이터셋
+scripts/train_real.py       롤링 CV로 모델 비교·최종 학습 (최종 모델)
+scripts/generate_data.py, scripts/train_synthetic.py   v1~v3 합성 데이터 실험 (기록용)
+app/main.py                 FastAPI 서빙
+models/                     학습된 모델, 지표
+tests/                      API(가짜 모델 주입) · 파서 · 피처 · 모델 품질 테스트
 ```
+
+## 9. 출처
+Jieming Zhu et al., *Loghub: A Large Collection of System Log Datasets for AI-driven Log Analytics*, ISSRE 2023.

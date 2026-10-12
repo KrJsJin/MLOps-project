@@ -1,6 +1,6 @@
 """로그인 이벤트 → 모델 입력 피처 변환.
 
-학습(scripts/train.py)과 서빙(app/main.py)이 **같은 함수**를 쓰도록 이 모듈 하나로 모아 둔다.
+학습(scripts/train_real.py)과 서빙(app/main.py)이 **같은 함수**를 쓰도록 이 모듈 하나로 모아 둔다.
 (training-serving skew 방지)
 
 입력 단위: 한 출발지 IP가 최근 10분(WINDOW_SECONDS) 동안 남긴 SSH 로그인 이벤트 목록.
@@ -112,3 +112,46 @@ def triage(feats: Mapping[str, float]) -> str:
 
 def to_vector(feats: Mapping[str, float]) -> list[float]:
     return [float(feats[name]) for name in FEATURE_NAMES]
+
+
+# ---------------------------------------------------------------------------
+# IP 이력 피처 (실제 데이터 v5에서 추가)
+# 10분 윈도우만으로는 "이 IP가 다시 올지" 예측이 불안정했다. 서버는 과거에 본 IP를
+# 기억할 수 있으므로, 실시간에서도 계산 가능한 이력만 피처로 쓴다 (미래 정보 사용 금지).
+# ---------------------------------------------------------------------------
+import math  # noqa: E402
+
+HISTORY_FEATURE_NAMES = [
+    "hist_windows_24h",      # 최근 24시간 동안 이 IP의 실패 윈도우 수
+    "hist_log_fails",        # 이 IP의 누적 실패 수 log(1+x)
+    # hist_hours_since_prev(이전 윈도우 이후 경과 시간)는 v6에서 제외:
+    # '1시간 이내'가 곧 직전 윈도우의 정답이라, 넣으면 모델이 행동 대신 이전 답을 베낀다
+    # (넣으면 CV 0.967 ≈ 단순 관성 규칙 0.957). 관성 효과는 서빙의 차단 TTL이 담당한다.
+]
+HISTORY_CAP_HOURS = 168.0
+
+
+class IPHistory:
+    """IP별 과거 윈도우 요약 저장소. 학습과 서빙이 같은 클래스를 쓴다."""
+
+    def __init__(self):
+        self._store: dict[str, list[tuple[float, float, int]]] = {}  # ip -> [(start, end, n_fail)]
+
+    def features(self, ip: str, now: float) -> dict[str, float]:
+        past = [w for w in self._store.get(ip, []) if w[1] <= now]
+        last24 = [w for w in past if now - w[1] <= 86400]
+        since = min(HISTORY_CAP_HOURS, (now - past[-1][1]) / 3600) if past else HISTORY_CAP_HOURS
+        return {
+            "hist_windows_24h": float(len(last24)),
+            "hist_hours_since_prev": float(since),   # 분석용 (모델 입력에서는 제외)
+            "hist_log_fails": math.log1p(sum(w[2] for w in past)),
+        }
+
+    def add(self, ip: str, start: float, end: float, n_fail: int) -> None:
+        self._store.setdefault(ip, []).append((start, end, n_fail))
+
+
+def window_bounds(events: Iterable[Mapping]) -> tuple[float, float, int]:
+    evs = list(events)
+    ts = [_to_epoch(e["ts"]) for e in evs]
+    return min(ts), max(ts), sum(e["result"] != "success" for e in evs)
